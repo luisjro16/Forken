@@ -44,17 +44,18 @@ class Captor:
         global captura
         captura = True
         
-        iface = self.extrair_iface()   
+        #iface = self.extrair_iface() 
+        iface = "eth0"  
         print(f'[INFO] Interface de captura: {iface}') 
 
-        sniffer = AsyncSniffer(
+        self.sniffer = AsyncSniffer(
             prn=self.processar_pacote,
             store=False,
             filter="ip",
             iface=iface 
         )
 
-        sniffer.start()
+        self.sniffer.start()
         print("[INFO] Captura iniciada...")
         
         
@@ -62,6 +63,10 @@ class Captor:
     def extrair_chave_fluxo(pkt):
         if IP in pkt:
             ip = pkt[IP]
+            proto = ''
+            sport = 0
+            dport = 0
+            
             if TCP in pkt:
                 proto = 'TCP'
                 sport = pkt[TCP].sport
@@ -71,13 +76,24 @@ class Captor:
                 sport = pkt[UDP].sport
                 dport = pkt[UDP].dport
             else:
-                proto = 'OTHER'
+                proto = str(ip.proto)
                 sport = 0
                 dport = 0
-            return (ip.src, ip.dst, sport, dport, proto)
+
+            if (ip.src < ip.dst) or \
+            (ip.src == ip.dst and sport < dport):
+                ip_A, port_A = ip.src, sport
+                ip_B, port_B = ip.dst, dport
+            else:
+                ip_A, port_A = ip.dst, dport
+                ip_B, port_B = ip.src, sport
+
+            return (ip_A, port_A, ip_B, port_B, proto)
         return None
 
     def processar_pacote(self, pkt):
+        print(f"[DEBUG PKT] Pacote recebido: {pkt.summary()}")
+        
         chave = self.extrair_chave_fluxo(pkt)
         if not chave:
             return
@@ -88,6 +104,9 @@ class Captor:
             self.fluxos_ativos[chave] = {
                 'inicio': agora,
                 'ultimo': agora,
+                'ip_iniciador': pkt[IP].src,
+                'porta_iniciador': pkt.sport if TCP in pkt or UDP in pkt else 0,
+                'destination_port_original': pkt.dport if TCP in pkt or UDP in pkt else 0,
                 'bytes_fwd': 0,
                 'bytes_bwd': 0,
                 'qtd_fwd': 0,
@@ -117,34 +136,65 @@ class Captor:
                 'act_data_pkt_fwd': 0,
                 'min_seg_size_forward': None,
                 'timestamps_fwd': [],
+                'timestamps_bwd': [],
+                'current_fwd_subflow_bytes': 0,
+                'fwd_subflow_byte_list': [],
+                'current_bwd_subflow_bytes': 0,
+                'bwd_subflow_byte_list': []
             }
 
         fluxo = self.fluxos_ativos[chave]
-        fluxo['Destination Port'] = pkt.dport if TCP in pkt else 0
         duracao = agora - fluxo['ultimo']
         fluxo['ultimo'] = agora
 
+        if 'Destination Port' not in fluxo:
+            fluxo['Destination Port'] = fluxo['destination_port_original']
+
         tam = len(pkt)
-        direcao = 'fwd' if pkt[IP].src == chave[0] else 'bwd'
+        if pkt[IP].src == fluxo['ip_iniciador']:
+            direcao = 'fwd'
+        else:
+            direcao = 'bwd'
 
         if direcao == 'fwd':
             fluxo['bytes_fwd'] += tam
             fluxo['qtd_fwd'] += 1
-            fluxo['subflow_bytes_fwd'] += tam
             fluxo['tamanhos_fwd'].append(tam)
-            fluxo['iat_fwd'].append(duracao)
+            if len(fluxo['timestamps_fwd']) > 0: 
+                iat_fwd_pkt = agora - fluxo['timestamps_fwd'][-1] 
+                fluxo['iat_fwd'].append(iat_fwd_pkt)
             fluxo['timestamps_fwd'].append(agora)
             
             if pkt.haslayer(TCP):
-                payload_len = len(pkt[TCP].payload)
-                if payload_len > 0:
+
+                if len(pkt[TCP].payload) > 0 and not pkt[TCP].flags.S:
                     fluxo['act_data_pkt_fwd'] += 1
+
+            fluxo['current_fwd_subflow_bytes'] += tam
+
+            if pkt.haslayer(TCP) and pkt[TCP].flags.P:  
+                if fluxo['current_fwd_subflow_bytes'] > 0: 
+                    fluxo['fwd_subflow_byte_list'].append(fluxo['current_fwd_subflow_bytes'])
+                fluxo['current_fwd_subflow_bytes'] = 0  
         else:
             fluxo['bytes_bwd'] += tam
             fluxo['qtd_bwd'] += 1
-            fluxo['subflow_bytes_bwd'] += tam
             fluxo['tamanhos_bwd'].append(tam)
-            fluxo['iat_bwd'].append(duracao)
+
+            if 'timestamps_bwd' not in fluxo: fluxo['timestamps_bwd'] = []
+            
+            if len(fluxo['timestamps_bwd']) > 0: 
+                iat_bwd_pkt = agora - fluxo['timestamps_bwd'][-1] 
+                fluxo['iat_bwd'].append(iat_bwd_pkt)
+            fluxo['timestamps_bwd'].append(agora)
+
+            fluxo['current_bwd_subflow_bytes'] += tam 
+
+            if pkt.haslayer(TCP) and pkt[TCP].flags.P:  
+                if fluxo['current_bwd_subflow_bytes'] > 0:
+                    fluxo['bwd_subflow_byte_list'].append(fluxo['current_bwd_subflow_bytes'])
+                fluxo['current_bwd_subflow_bytes'] = 0
+
             
 
         fluxo['tamanhos'].append(tam)
@@ -153,10 +203,6 @@ class Captor:
         if pkt.haslayer(TCP):
             flags = pkt[TCP].flags
             tam_segmento = len(pkt[TCP].payload)
-            
-            seg_size = len(pkt[TCP].payload)
-            if fluxo['min_seg_size_forward'] is None or seg_size < fluxo['min_seg_size_forward']:
-                fluxo['min_seg_size_forward'] = seg_size
             
             if flags & 0x01:  # FIN
                 fluxo['FIN Flag Count'] += 1
@@ -181,6 +227,14 @@ class Captor:
                     
                 if fluxo['Init_Win_bytes_forward'] is None:
                     fluxo['Init_Win_bytes_forward'] = pkt[TCP].window
+
+                if len(pkt[TCP].payload) > 0 and not pkt[TCP].flags.S:
+                    current_payload_len = len(pkt[TCP].payload)
+                    if fluxo['min_seg_size_forward'] is None or current_payload_len < fluxo['min_seg_size_forward']:
+                        fluxo['min_seg_size_forward'] = current_payload_len
+                elif pkt[TCP].flags.S and fluxo['min_seg_size_forward'] is None : 
+                    if fluxo.get('min_seg_size_forward') is None : # So seta para 0 se ainda for None
+                        fluxo['min_seg_size_forward'] = 0
                     
             else:
                 fluxo['bwd_segment_sizes'].append(tam_segmento)
@@ -200,22 +254,33 @@ class Captor:
                 fluxo['header_len_bwd'] += total_header_len
         
     def encerrar_todos_fluxos(self):
-        for chave, fluxo in list(self.fluxos_ativos.items()):
+        for chave, fluxo in list(self.fluxos_ativos.items()): # Usar list() para poder deletar da original
             print(f"[INFO] Encerrando fluxo: {chave}")
+
+            # Finaliza o último subfluxo forward, se houver bytes acumulados
+            if fluxo.get('current_fwd_subflow_bytes', 0) > 0:
+                fluxo.get('fwd_subflow_byte_list', []).append(fluxo['current_fwd_subflow_bytes'])
+                fluxo['current_fwd_subflow_bytes'] = 0 # Opcional, apenas para limpar
+
+            # Finaliza o último subfluxo backward, se houver bytes acumulados
+            if fluxo.get('current_bwd_subflow_bytes', 0) > 0:
+                fluxo.get('bwd_subflow_byte_list', []).append(fluxo['current_bwd_subflow_bytes'])
+                fluxo['current_bwd_subflow_bytes'] = 0 # Opcional
+
             features = self.extrair_features_fluxo(fluxo)
-            resultado = self.processar_fluxo(features)
-            self.resultados_fluxos.append(resultado)
+            resultado = self.processar_fluxo(features) # Supondo que processar_fluxo ainda é chamado aqui
+            self.resultados_fluxos.append(resultado) # ou o DataFrame de features antes do PCA
             del self.fluxos_ativos[chave]
 
     def extrair_features_fluxo(self, fluxo):
         atividades = []
         
-        if (fluxo['ultimo'] - fluxo['inicio']) > 0:
+        '''if (fluxo['ultimo'] - fluxo['inicio']) > 0:
             FwdPackets = fluxo['qtd_fwd'] / (fluxo['ultimo'] - fluxo['inicio'])
             BwdPackets = fluxo['qtd_bwd'] / (fluxo['ultimo'] - fluxo['inicio'])
         else:
             FwdPackets = 0
-            BwdPackets = 0
+            BwdPackets = 0'''
             
         timestamps = fluxo.get('timestamps_fwd', [])
         if len(timestamps) >= 2:
@@ -236,17 +301,37 @@ class Captor:
         for t in fluxo['iat']:
             if t > 1:  
                 idle_times.append(t)
+
+        flow_duration = fluxo['ultimo'] - fluxo['inicio']
+        # Se a duração for zero mas existiram pacotes, atribua uma duração mínima muito pequena (ex: 1 microssegundo)
+        # Isso evita divisão por zero e dá algum valor às taxas.
+        if flow_duration == 0 and (fluxo['qtd_fwd'] + fluxo['qtd_bwd']) > 0:
+            flow_duration = 1e-6  # 0.000001 segundos
+
+        # Use flow_duration ao calcular taxas:
+        total_bytes = fluxo['bytes_fwd'] + fluxo['bytes_bwd']
+        total_pkts = fluxo['qtd_fwd'] + fluxo['qtd_bwd']
+
+        flow_bytes_s = total_bytes / flow_duration if flow_duration > 0 else 0
+        flow_packets_s = total_pkts / flow_duration if flow_duration > 0 else 0
+        fwd_packets_s = fluxo['qtd_fwd'] / flow_duration if flow_duration > 0 else 0
+        bwd_packets_s = fluxo['qtd_bwd'] / flow_duration if flow_duration > 0 else 0
         
+        fwd_subflow_list = fluxo.get('fwd_subflow_byte_list', [])
+        bwd_subflow_list = fluxo.get('bwd_subflow_byte_list', [])
+
+        avg_subflow_fwd_bytes = np.mean(fwd_subflow_list) if fwd_subflow_list else 0
+        avg_subflow_bwd_bytes = np.mean(bwd_subflow_list) if bwd_subflow_list else 0
         return {
-            'Destination Port': fluxo['Destination Port'],
+            'Destination Port': fluxo['destination_port_original'],
             'Total Length of Fwd Packets': fluxo['bytes_fwd'],
             'Fwd Packet Length Min': min(fluxo['tamanhos_fwd']) if fluxo['tamanhos_fwd'] else 0,
             'Bwd Packet Length Max': max(fluxo['tamanhos_bwd']) if fluxo['tamanhos_bwd'] else 0,
             'Bwd Packet Length Min': min(fluxo['tamanhos_bwd']) if fluxo['tamanhos_bwd'] else 0,
             'Bwd Packet Length Mean': np.mean(fluxo['tamanhos_bwd']) if fluxo['tamanhos_bwd'] else 0,
             'Bwd Packet Length Std': np.std(fluxo['tamanhos_bwd']) if fluxo['tamanhos_bwd'] else 0,
-            'Flow Bytes/s': fluxo['bytes_fwd'] / (fluxo['ultimo'] - fluxo['inicio']) if (fluxo['ultimo'] - fluxo['inicio']) > 0 else 0,
-            'Flow Packets/s': (fluxo['qtd_fwd'] + fluxo['qtd_bwd']) / (fluxo['ultimo'] - fluxo['inicio']) if (fluxo['ultimo'] - fluxo['inicio']) > 0 else 0,
+            'Flow Bytes/s': flow_bytes_s,
+            'Flow Packets/s': flow_packets_s,
             'Flow IAT Mean': np.mean(fluxo['iat']) if fluxo['iat'] else 0,
             'Flow IAT Max': max(fluxo['iat']) if fluxo['iat'] else 0,
             'Flow IAT Std': np.std(fluxo['iat']) if fluxo['iat'] else 0,
@@ -273,8 +358,8 @@ class Captor:
             'Fwd URG Flags': fluxo['urg_count'],
             'Fwd Header Length': fluxo['header_len_fwd'],
             'Bwd Header Length': fluxo['header_len_bwd'],
-            'Fwd Packets/s': FwdPackets,
-            'Bwd Packets/s': BwdPackets,
+            'Fwd Packets/s': fwd_packets_s,
+            'Bwd Packets/s': bwd_packets_s,
             'Max Packet Length': max(fluxo['tamanhos']) if fluxo['tamanhos'] else 0,
             'Min Packet Length': min(fluxo['tamanhos']) if fluxo['tamanhos'] else 0,
             'Packet Length Mean': np.mean(fluxo['tamanhos']) if fluxo['tamanhos'] else 0,
@@ -287,11 +372,11 @@ class Captor:
             'URG Flag Count': fluxo['URG Flag Count'],
             'ECE Flag Count': fluxo['ECE Flag Count'],
             'Down/Up Ratio': fluxo['qtd_bwd'] / fluxo['qtd_fwd'] if fluxo['qtd_fwd'] > 0 else 0,
-            'Average Packet Size': sum(fluxo['tamanhos']) / len(fluxo['tamanhos']),
+            'Average Packet Size': total_bytes / total_pkts if total_pkts > 0 else 0,
             'Avg Fwd Segment Size': sum(fluxo['fwd_segment_sizes']) / len(fluxo['fwd_segment_sizes']) if fluxo['fwd_segment_sizes'] else 0,
             'Avg Bwd Segment Size': sum(fluxo['bwd_segment_sizes']) / len(fluxo['bwd_segment_sizes']) if fluxo['bwd_segment_sizes'] else 0,
-            'Subflow Fwd Bytes': fluxo['subflow_bytes_fwd'],
-            'Subflow Bwd Bytes': fluxo['subflow_bytes_bwd'],
+            'Subflow Fwd Bytes': avg_subflow_fwd_bytes,
+            'Subflow Bwd Bytes': avg_subflow_bwd_bytes,
             'Init_Win_bytes_forward': fluxo['Init_Win_bytes_forward'],
             'Init_Win_bytes_backward': fluxo['Init_Win_bytes_backward'],
             'act_data_pkt_fwd': fluxo['act_data_pkt_fwd'],
@@ -362,16 +447,41 @@ class Captor:
 
         return df
 
-    def parar_captura(self, tempo):
-        global sniffer
-        global captura
-        
-        print(f"[INFO] A captura vai durar {tempo} segundos.")
-        time.sleep(tempo)
-        
-        captura = False
-        print("[INFO] Encerrando todos os fluxos ativos...")
-        self.encerrar_todos_fluxos()
+    def parar_captura(self, tempo_de_espera):
+        print(f"[INFO] Captura principal rodando por {tempo_de_espera} segundos.")
+        time.sleep(tempo_de_espera)
+
+        print("[INFO] Tentando parar o sniffer...")
+        if hasattr(self, 'sniffer') and self.sniffer is not None:
+            print(f"[DEBUG] Tipo de self.sniffer: {type(self.sniffer)}")
+
+            try:
+                is_stop_event_set = False
+                if hasattr(self.sniffer, '_stop') and hasattr(self.sniffer._stop, 'is_set'):
+                    is_stop_event_set = self.sniffer._stop.is_set()
+                    print(f"[DEBUG] self.sniffer._stop.is_set() = {is_stop_event_set}")
+
+                if not is_stop_event_set: 
+                    print("[DEBUG] Chamando self.sniffer.stop()...")
+                    self.sniffer.stop(join=True) 
+                    print("[INFO] Tentativa de parada do sniffer concluída.")
+                else:
+                    print("[WARN] Sniffer já tinha o evento de parada (_stop) setado.")
+
+            except AttributeError as e_attr: 
+                print(f"[ERROR] AttributeError durante a parada do sniffer (is_alive ainda pode ser o problema): {e_attr}")
+            except Exception as e: 
+                print(f"[ERROR] Erro ao chamar self.sniffer.stop(): {e}")
+        else:
+            print("[WARN] self.sniffer não foi encontrado ou não foi inicializado.")
+
+        print(f"[DEBUG] Número de fluxos ativos ANTES de encerrar: {len(self.fluxos_ativos)}")
+        if self.fluxos_ativos: # Verifica se o dicionário de fluxos NÃO está vazio
+            print("[INFO] Encerrando todos os fluxos ativos...")
+            self.encerrar_todos_fluxos() # CHAMA O MÉTODO PARA PROCESSAR OS FLUXOS
+        else:
+            print("[INFO] Nenhum fluxo ativo para encerrar.") # Imprime se self.fluxos_ativos estiver vazio
+        # // SEÇÃO FALTANDO TERMINA AQUI //
             
     def show(self):
         if self.resultados_fluxos:
@@ -394,11 +504,11 @@ class Captor:
         return resultado
 
 if __name__ == "__main__":
-    
+
     captor = Captor()
     captor.iniciar_captura()
     
-    tempo = 30
+    tempo = 90
     
     captor.parar_captura(tempo)
     
